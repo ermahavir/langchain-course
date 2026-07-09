@@ -2,6 +2,8 @@ import asyncio
 import os
 import ssl
 import certifi
+import re
+import requests
 
 from typing import Any, Dict, List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -13,6 +15,8 @@ from langchain_tavily import TavilyCrawl, TavilyExtract, TavilyMap
 from logger import log_info, log_success, log_error, log_warning, log_header, Colors
 from dotenv import load_dotenv
 
+URL_TO_CRAWL = "https://docs.langchain.com/oss/python/langchain/overview"
+#URL_TO_CRAWL = "http://quotes.toscrape.com"
 
 load_dotenv(override=True)
 
@@ -25,7 +29,7 @@ embeddings = OpenAIEmbeddings(
     model=os.getenv("EMBEDDING_MODEL"),
     base_url="https://inference-api.nvidia.com/v1",
     api_key=os.getenv("OPENAI_API_KEY"),
-    show_progress_bar=True,
+    show_progress_bar=False,
     chunk_size=50, # 50 langchain documents and text objects that we're going to embed at a single request.
     retry_min_seconds=0, # No retries
 )
@@ -38,6 +42,7 @@ tavily_map = TavilyMap(max_depth=5, max_breadth=20, max_pages=100)
 tavily_crawl = TavilyCrawl(max_depth=5, max_breadth=20, max_pages=100)
 
 def chunk_urls(urls: List[str], chunk_size: int = 20) -> List[List[str]]:
+    #urls = urls[0:20]
     chunks = [] # List of lists of strings
     for i in range(0, len(urls), chunk_size):
         chunk = urls[i:i + chunk_size]
@@ -103,26 +108,23 @@ async def async_index_documents(documents: List[Document], batch_size: int = 50)
             await vectorstore.aadd_documents(batch)
             log_success(f"Batch number {batch_number} added to vector store with {len(batch)} documents")
         except Exception as e:
-            log_error(f"Error adding batch number {batch_number} to vector store: {e}", Colors.RED)
+            log_error(f"Error adding batch number {batch_number} to vector store: {e}")
             return False
         return True
 
+    tasks = [add_batch(batch, i) for i, batch in enumerate(batches)]
+
     # Process batches concurrently 
-    # NOTE: vectorstore implements an async context manager (__aenter__ / __aexit__)
+    # NOTE: Pinecone vectorstore implements an async context manager (__aenter__ / __aexit__)
     # The internal async index/session (shared resource) is opened and closed once in these calls.
     #
     # async with vectorstore: keeps that session open for all concurrent batches,
     # then closes it once after they all finish.
-    tasks = [add_batch(batch, i) for i, batch in enumerate(batches)]
-
     if hasattr(vectorstore, "__aenter__") and hasattr(vectorstore, "__aexit__"):
         async with vectorstore:
             results = await asyncio.gather(*tasks, return_exceptions=True)
     else:
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     successful = sum(1 for result in results if result is True)
 
@@ -148,13 +150,25 @@ async def main():
 
     log_header("Document Ingestion Pipeline")
 
-    log_info("Tavil Map Starting to map documentation from https://python.langchain.com", Colors.PURPLE)
+    log_info("Tavil Map Starting to map documentation from https://docs.langchain.com/oss/python/langchain/overview", Colors.PURPLE)
 
-    site_map = tavily_map.invoke("https://python.langchain.com")
+    # site_map = tavily_map.invoke(f"{URL_TO_CRAWL}")
+    # if "error" in site_map:
+    #     log_error(f"Tavily Map failed: {site_map['error']}")
+    #     return
+    #urls = site_map["results"]    
+    
+    text = requests.get("https://docs.langchain.com/llms.txt", timeout=30).text
+    # Markdown links: [title](https://...)
+    md_urls = re.findall(r"\[[^\]]*\]\((https?://[^)]+)\)", text)
+    # Fallback raw URLs
+    raw_urls = re.findall(r"https?://[^\s)>]+", text)
+    urls = sorted(set(md_urls + raw_urls))
+    
+    chunks = chunk_urls(urls, 5)
 
-    chunks = chunk_urls(site_map["results"], 5)
-
-    log_success(f"URL processing completed with {len(site_map['results'])} documents, URLs chunked into {len(chunks)} chunks")
+    url_count = len(urls)
+    log_success(f"URL processing completed with {url_count} documents, URLs chunked into {len(chunks)} chunks")
 
     log_info("Starting concurrent document extraction", Colors.DARKCYAN)
     all_pages = await async_extract(chunks)
@@ -168,7 +182,7 @@ async def main():
     await async_index_documents(splitted_docs, batch_size=10)
 
     log_header("Document Ingestion Pipeline Completed")
-    print(f"URLs mapped: {len(site_map['results'])}")
+    print(f"URLs mapped: {url_count}")
     print(f"Documents extracted: {len(all_pages)}")
     print(f"Chunks created: {len(splitted_docs)}")
 
