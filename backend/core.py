@@ -1,7 +1,7 @@
 import os
 import re
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
@@ -47,6 +47,62 @@ def retrieve_context(query: str):
     # Return both serialized content and raw documents
     return serialized, retrieved_docs
 
+def parse_answer_and_source(answer_payload: Any) -> Dict[str, str]:
+    """Parse model output and extract clean answer + source URL."""
+    # 1) Normalize payload -> text
+    if isinstance(answer_payload, str):
+        text = answer_payload.strip()
+    elif isinstance(answer_payload, list):
+        text_parts: List[str] = []
+        for block in answer_payload:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = str(block.get("text", "")).strip()
+                if t:
+                    text_parts.append(t)
+        text = "\n\n".join(text_parts).strip()
+    elif isinstance(answer_payload, dict):
+        text = str(answer_payload.get("text", "")).strip()
+    else:
+        text = str(answer_payload).strip()
+    answer_text = text
+    source = "N/A"
+    source_label = "Source"
+    # 2) Parse inline "Source:" / "Sources:" blocks.
+    source_match = re.search(
+        r"\bSources?\s*:\s*(.+)$",
+        answer_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if source_match:
+        source = source_match.group(1).strip()
+        answer_text = answer_text[: source_match.start()].strip()
+
+    # 3) Parse markdown source links anywhere in the answer
+    md_match = re.search(r"\[Source[s]?\]\((https?://[^)\s]+)\)", answer_text, flags=re.IGNORECASE)
+    if md_match:
+        source = md_match.group(1)
+        source_label = "Source (MD)"
+        answer_text = re.sub(
+            r"\s*\[Source[s]?\]\(https?://[^)]+\)",
+            "",
+            answer_text,
+            flags=re.IGNORECASE,
+        ).strip()
+    # 4) Normalize source to first URL if source contains prose/markdown
+    url_match = re.search(r"https?://[^\s)\]]+", source)
+    if url_match:
+        source = url_match.group(0).rstrip(".,;)]")
+    # 5) Fallback: if still N/A, try extracting URL from full text
+    if source == "N/A":
+        fallback_url = re.search(r"https?://[^\s)\]]+", text)
+        if fallback_url:
+            source = fallback_url.group(0).rstrip(".,;)]")
+    return {
+        "answer": answer_text.strip(),
+        "source": source,
+        "source_label": source_label,
+    }
+
 def run_llm(query: str) -> Dict[str, Any]:
     """
     Run the RAG pipeline to answer a query using retrieved documentation.
@@ -65,7 +121,9 @@ def run_llm(query: str) -> Dict[str, Any]:
         "You have access to a tool that retrieves relevant documentation. "
         "Use the tool to find relevant information before answering questions. "
         "Always cite the sources you use in your answers. "
-        "If you cannot find the answer in the retrieved documentation, say so."
+        "If you cannot find the answer in the retrieved documentation, say so. "
+        "ALWAYS answer in the same language as the question. NEVER ever use a different language. "
+        "Do NOT include inline Source/Sources text in the answer body."
     )
 
     agent = create_agent(
@@ -75,11 +133,16 @@ def run_llm(query: str) -> Dict[str, Any]:
     )
 
     messages = [
-        {"role":"user", "content": query}, 
-    ]
-
+    {
+        "role": "system",
+        "content": "Reply strictly in the same language as the user's question. Do not mix languages.",
+    },
+    {"role": "user", "content": query}]
     response = agent.invoke({"messages": messages})
-    answer = response["messages"][-1].content
+
+    # Parse final model answer (handles list/dict/string formats)
+    answer_payload = response["messages"][-1].content if response.get("messages") else ""
+    parsed_result = parse_answer_and_source(answer_payload)
 
     #extract context doc from ToolMessage artifact
     context_docs = []
@@ -88,52 +151,12 @@ def run_llm(query: str) -> Dict[str, Any]:
             if isinstance(msg.artifact, list):
                 context_docs.extend(msg.artifact)
             elif isinstance(msg.artifact, dict):
-                context_docs.append(msg.artifacts)
+                context_docs.append(msg.artifact)
 
     return {
-        "answer": answer,
+        "answer": parsed_result.get("answer", "").strip(),
         "context": context_docs,
     }
-
-def print_answer_and_source(result: dict) -> None:
-    answer_blocks = result.get("answer", [])
-    for block in answer_blocks:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text", "").strip()
-            answer_text = text
-            source = "N/A"
-            source_label = "Source"
-
-            # Handle inline "Source: <...>" format.
-            if "Source:" in text:
-                answer_text, source = text.rsplit("Source:", 1)
-                answer_text = answer_text.strip()
-                source = source.strip()
-            else:
-                # Handle markdown-style source links, e.g. [Source](https://...).
-                match = re.search(r"\[Source\]\((https?://[^)]+)\)", text)
-                if match:
-                    source = match.group(1)
-                    source_label = "Source (MD)"
-                    # Remove markdown source links wherever they appear.
-                    answer_text = re.sub(
-                        r"\s*\[Source\]\(https?://[^)]+\)",
-                        "",
-                        text,
-                    ).strip()
-
-            print("Answer:")
-            print(answer_text)
-            # Clean up stray markdown punctuation around extracted source.
-            source = source.strip().strip("[]()")
-            # Normalize source to the first URL if the model includes prose/markdown.
-            url_match = re.search(r"https?://[^\s)\]]+", source)
-            if url_match:
-                source = url_match.group(0).rstrip(".,;")
-            print(f"\n{source_label}:")
-            print(source)
-            return
-    print("No text answer block found.")
 
 if __name__ == "__main__":
     query = "What is a deep agent in LangChain?"
