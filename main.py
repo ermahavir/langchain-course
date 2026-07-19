@@ -1,51 +1,65 @@
-# Annotated is going to help us add metadata to the type hints
-from typing import Annotated, TypedDict
-
 from dotenv import load_dotenv
-load_dotenv()
+from typing import Literal
 
-from langchain_core.messages import HumanMessage, BaseMessage
-from langgraph.graph import END, StateGraph
-from langgraph.graph import add_messages
-
-from chains import generate_chain, reflection_chain
-from nodes import generation_node, reflection_node
-from nodes import MessageGraph
+from langchain_core.messages import ToolMessage, AIMessage
+from langgraph.graph import StateGraph, START, END, MessagesState
 
 
-REFLECT = "reflect"
-GENERATE = "generate"
-    
+from chains import first_responder, revisor
+from tool_executor import execute_tool
 
-builder  = StateGraph(state_schema=MessageGraph)
-builder.add_node(GENERATE, generation_node)
-builder.set_entry_point(GENERATE)
-builder.add_node(REFLECT, reflection_node)
+MAX_ITERATIONS = 2
 
-def should_continue(state: MessageGraph) -> str:
-    if len(state["messages"]) > 6:
+def draft_node(state: MessagesState) -> MessagesState:
+    response = first_responder.invoke(state["messages"])
+    return {"messages": [response]}
+
+def revise_node(state: MessagesState) -> MessagesState:
+    response = revisor.invoke(state["messages"])
+    return {"messages": [response]}
+
+def event_loop(state: MessagesState) -> Literal["execute_tool", END]:
+    count_total_visits = sum(isinstance(item, ToolMessage) for item in state["messages"])
+    num_iterations = count_total_visits
+    if num_iterations > MAX_ITERATIONS:
         return END
-    return REFLECT
-
-builder.add_conditional_edges(GENERATE, should_continue, {REFLECT: REFLECT, END: END})
-builder.add_edge(REFLECT, GENERATE)
+    return "execute_tool"
 
 
+builder = StateGraph(MessagesState)
+builder.add_node("draft", draft_node)
+builder.add_node("execute_tool", execute_tool)
+builder.add_node("revise", revise_node)
+
+builder.add_edge(START, "draft")
+builder.add_edge("draft", "execute_tool")
+builder.add_edge("execute_tool", "revise")
+builder.add_conditional_edges("revise", event_loop, ["execute_tool", END])
 graph = builder.compile()
-print(graph.get_graph().draw_mermaid_png(output_file_path="graph.png"))
-graph.get_graph().print_ascii() #uv add grandalf 
 
-def main():
+graph.get_graph().draw_mermaid_png(output_file_path="reflection_agent.png")
 
-    inputs = HumanMessage(content="""
-        Make this tweet better: @LangchainAI Newly Tool calling is seriously underrated
-        After a long wait, it is here - making implementation of agents across different models with function - calling
-        super easy. Made a video covering their newest blog post.
-    """)
 
-    response =graph.invoke({"messages": [inputs]})
-    
+res = graph.invoke(
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Write about AI-Powered SOC / autonomous soc problem domain, list startups that do that and raised capital.",
+            }    
+        ]
+    }
+)
 
-if __name__ == "__main__":
-    main()
-    
+last_message = res["messages"][-1]
+
+if isinstance(last_message, AIMessage) and last_message.tool_calls:
+    print(last_message.tool_calls[0]["args"]["answer"])
+
+print(res)
+
+# def main():
+#     print("Hello from relexion agent!")
+
+# if __name__ == "__main__":
+#     main()
