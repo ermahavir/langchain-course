@@ -1,5 +1,8 @@
+from graph.graph import app
+
 def main():
-    print("Hello from langchain-course!")
+    response = app.invoke({"question": "HOW TO MAKE PIZZA"})
+    print(response["generation"].answer)
 
 
 if __name__ == "__main__":

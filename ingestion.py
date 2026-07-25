@@ -51,5 +51,5 @@ vectorstore = Chroma.from_documents(documents=doc_splits, collection_name="rag-c
 retriever = Chroma(
     collection_name="rag-chroma",
     embedding_function=openai_embeddings,
-    persist_directory="./.chroma_db"
-)
+    persist_directory="./.chroma_db",
+).as_retriever()
